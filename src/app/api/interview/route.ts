@@ -13,8 +13,10 @@ import {
   type Message,
 } from "@/lib/interview";
 
-// 使用的模型：可在 .env.local 用 GEMINI_MODEL 覆寫，沒設定就用 gemini-2.5-flash
-const MODEL = process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
+// 使用的模型：可在 .env.local 用 GEMINI_MODEL 覆寫，沒設定就用 gemini-3.5-flash
+const MODEL = process.env.GEMINI_MODEL ?? "gemini-3.5-flash";
+// 主模型過載時改用的備用模型（較輕量、通常比較不擁擠）
+const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL ?? "gemini-3.5-flash-lite";
 
 // 出題時的系統指令：設定 AI 扮演面試官，並規範出題方式（一次一題、可追問、不給答案）
 const INTERVIEWER_PROMPT = `你是一位專業、友善但嚴謹的面試官，正在依照職缺描述進行模擬面試。
@@ -67,23 +69,38 @@ type RawEvaluation = Omit<Evaluation, "questionReviews"> & {
 
 // Gemini 偶爾會因流量過高回 503 / 429，等一下再試通常就會成功
 const RETRYABLE_STATUS = new Set([429, 500, 503]); // 值得重試的 HTTP 狀態碼
-const RETRY_DELAYS_MS = [1000, 2000, 4000]; // 每次重試前等待的時間，越等越久，最多重試 3 次
+const RETRY_DELAYS_MS = [1000, 2000]; // 每次重試前等待的時間，越等越久，每個模型最多重試 2 次
+const REQUEST_TIMEOUT_MS = 60_000; // 單次呼叫最多等 60 秒，避免請求卡住好幾分鐘
 
-// 包住任何 Gemini 呼叫：失敗且狀態碼可重試時，等一下再重來；其他錯誤或重試用完就直接丟出
-async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await fn(); // 成功就直接回傳結果
-    } catch (err) {
-      const status = (err as { status?: number })?.status;
-      // 重試次數用完、沒有狀態碼、或不是可重試的錯誤（例如 400 參數錯）→ 放棄並往外丟
-      if (attempt >= RETRY_DELAYS_MS.length || !status || !RETRYABLE_STATUS.has(status)) {
-        throw err;
+// 判斷錯誤是否值得重試：過載類的狀態碼，或是呼叫逾時
+function isRetryable(err: unknown) {
+  const { status, name } = (err ?? {}) as { status?: number; name?: string };
+  if (status) return RETRYABLE_STATUS.has(status);
+  return name === "AbortError" || name === "TimeoutError";
+}
+
+// 包住任何 Gemini 呼叫：失敗且可重試時，等一下再重來；主模型重試用完就換備用模型再試一輪
+// 其他錯誤（例如 400 參數錯）或全部重試用完就直接丟出
+async function withRetry<T>(fn: (model: string) => Promise<T>): Promise<T> {
+  const models = [MODEL, FALLBACK_MODEL];
+  for (const [i, model] of models.entries()) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fn(model); // 成功就直接回傳結果
+      } catch (err) {
+        if (!isRetryable(err)) throw err;
+        if (attempt >= RETRY_DELAYS_MS.length) {
+          if (i === models.length - 1) throw err; // 備用模型也失敗 → 放棄
+          console.warn(`${model} 持續失敗，改用備用模型 ${models[i + 1]}`);
+          break; // 跳出內層迴圈，換下一個模型
+        }
+        const status = (err as { status?: number }).status ?? "逾時";
+        console.warn(`${model} 回應 ${status}，${RETRY_DELAYS_MS[attempt]}ms 後重試`);
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt])); // 等待後進入下一輪
       }
-      console.warn(`Gemini 回應 ${status}，${RETRY_DELAYS_MS[attempt]}ms 後重試`);
-      await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt])); // 等待後進入下一輪
     }
   }
+  throw new Error("沒有可用的模型"); // 理論上不會執行到這裡
 }
 
 // 檢查前端送來的資料格式是否正確（型別守衛：通過後 TypeScript 就會把 body 視為 InterviewRequest）
@@ -152,9 +169,9 @@ async function askQuestion(
     })),
   ];
 
-  const res = await withRetry(() =>
+  const res = await withRetry((model) =>
     ai.models.generateContent({
-      model: MODEL,
+      model,
       contents,
       config: { systemInstruction: INTERVIEWER_PROMPT }, // 套用面試官的規則
     }),
@@ -169,9 +186,9 @@ async function evaluate(
   messages: Message[],
 ): Promise<Evaluation> {
   const pairs = toQAPairs(messages);
-  const res = await withRetry(() =>
+  const res = await withRetry((model) =>
     ai.models.generateContent({
-      model: MODEL,
+      model,
       contents: `職缺描述：\n${jobDescription}\n\n面試逐字稿（共 ${pairs.length} 題）：\n${toTranscript(pairs)}`,
       config: {
         systemInstruction: EVALUATOR_PROMPT, // 套用評分規則
@@ -212,7 +229,11 @@ export async function POST(request: Request) {
   const { jobDescription, totalQuestions, messages } = body;
   const answered = messages.filter((m) => m.role === "candidate").length;
   console.log(`面試進度：已回答 ${answered} / ${totalQuestions} 題`);
-  const ai = new GoogleGenAI({ apiKey });
+  // 關掉 SDK 內建的重試（預設 5 次），只用上面的 withRetry，避免兩層重試疊加拖到好幾分鐘
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: { timeout: REQUEST_TIMEOUT_MS, retryOptions: { attempts: 1 } },
+  });
 
   try {
     let result: InterviewResponse;
