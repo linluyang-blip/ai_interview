@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { openApiKeySettings, useApiKey } from "@/lib/apiKey";
 import {
+  API_KEY_HEADER,
   DEFAULT_QUESTIONS,
   MAX_QUESTIONS,
   MIN_QUESTIONS,
@@ -29,6 +31,7 @@ export default function InterviewPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
+  const apiKey = useApiKey();
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -40,10 +43,11 @@ export default function InterviewPage() {
     try {
       const res = await fetch("/api/interview", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", [API_KEY_HEADER]: apiKey },
         body: JSON.stringify({ jobDescription, totalQuestions, messages: history }),
       });
       const data = await res.json();
+      if (res.status === 401) openApiKeySettings(); // 沒有金鑰或金鑰無效 → 直接打開設定視窗
       if (!res.ok) throw new Error(data.error ?? "發生未知錯誤");
 
       const result = data as InterviewResponse;
@@ -65,6 +69,10 @@ export default function InterviewPage() {
 
   async function startInterview() {
     if (!jobDescription.trim()) return;
+    if (!apiKey) {
+      openApiKeySettings();
+      return;
+    }
     setStage("interview");
     setMessages([]);
     await callInterview([]);
@@ -135,6 +143,21 @@ export default function InterviewPage() {
             <div className="font-display text-lg italic text-accent">Step 1</div>
             <h1 className="mt-1 font-serif text-3xl font-bold">告訴我們你要面試的職缺</h1>
             <p className="mt-3 text-ink-2">貼上職缺描述並選擇題數，AI 面試官會依內容逐題提問。</p>
+
+            {!apiKey && (
+              <div className="mt-6 flex flex-col gap-3 rounded-2xl border border-accent/30 bg-accent-soft p-4 text-sm sm:flex-row sm:items-center sm:justify-between">
+                <span>
+                  開始前請先設定你的 <strong>Gemini API 金鑰</strong>，金鑰只會存在這個瀏覽器。
+                </span>
+                <button
+                  type="button"
+                  onClick={openApiKeySettings}
+                  className="shrink-0 rounded-full bg-ink px-4 py-2 text-paper transition hover:bg-accent"
+                >
+                  設定金鑰
+                </button>
+              </div>
+            )}
 
             <label htmlFor="jd" className="mt-8 block text-sm font-medium">
               職缺描述

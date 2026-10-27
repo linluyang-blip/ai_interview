@@ -1,4 +1,5 @@
 import Link from "next/link";
+import ApiKeySettings from "./ApiKeySettings";
 import Logo from "./Logo";
 
 const NAV = [
@@ -19,12 +20,15 @@ export default function SiteHeader() {
             </Link>
           ))}
         </nav>
-        <Link
-          href="/interview"
-          className="rounded-full bg-ink px-5 py-2 text-sm font-medium text-paper transition hover:bg-accent"
-        >
-          開始練習 →
-        </Link>
+        <div className="flex items-center gap-2">
+          <ApiKeySettings />
+          <Link
+            href="/interview"
+            className="rounded-full bg-ink px-5 py-2 text-sm font-medium text-paper transition hover:bg-accent"
+          >
+            開始練習 →
+          </Link>
+        </div>
       </div>
     </header>
   );

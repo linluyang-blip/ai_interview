@@ -5,6 +5,7 @@
 import { GoogleGenAI, Type, type Content } from "@google/genai";
 // 前後端共用的常數與型別（題數上下限、訊息、評分格式等）
 import {
+  API_KEY_HEADER,
   MAX_QUESTIONS,
   MIN_QUESTIONS,
   type Evaluation,
@@ -208,12 +209,18 @@ async function evaluate(
   return { ...raw, questionReviews };
 }
 
+// 金鑰錯誤的判斷：Gemini 對無效金鑰回 400（訊息含 API key），對沒有權限的金鑰回 401 / 403
+function isInvalidKeyError(err: unknown) {
+  const { status, message } = (err ?? {}) as { status?: number; message?: string };
+  return status === 401 || status === 403 || (status === 400 && /api[ _]?key/i.test(message ?? ""));
+}
+
 // API 進入點：處理 POST /api/interview 請求
 export async function POST(request: Request) {
-  // 1. 確認伺服器有設定 API 金鑰
-  const apiKey = process.env.GEMINI_API_KEY;
+  // 1. BYOK：使用使用者自己的金鑰（前端從 localStorage 取出、放在標頭帶來），伺服器不保存也不提供金鑰
+  const apiKey = request.headers.get(API_KEY_HEADER)?.trim();
   if (!apiKey) {
-    return Response.json({ error: "伺服器未設定 GEMINI_API_KEY" }, { status: 500 });
+    return Response.json({ error: "請先在右上角「設定 API 金鑰」輸入你的 Gemini API 金鑰" }, { status: 401 });
   }
 
   // 2. 解析並驗證前端送來的資料（JSON 壞掉時當作 null，會在驗證時被擋下）
@@ -248,7 +255,14 @@ export async function POST(request: Request) {
     }
     return Response.json(result);
   } catch (err) {
-    // 5. 重試後仍失敗（或其他錯誤）→ 回傳 502，前端會顯示錯誤並讓使用者重送
+    // 5a. 金鑰無效 → 回傳 401，提醒使用者檢查金鑰（不印出錯誤內容，避免金鑰相關資訊進到紀錄）
+    if (isInvalidKeyError(err)) {
+      return Response.json(
+        { error: "Gemini API 金鑰無效或沒有權限，請到右上角重新設定" },
+        { status: 401 },
+      );
+    }
+    // 5b. 重試後仍失敗（或其他錯誤）→ 回傳 502，前端會顯示錯誤並讓使用者重送
     console.error("Gemini 呼叫失敗：", err);
     return Response.json({ error: "AI 面試官暫時無法回應，請稍後再試" }, { status: 502 });
   }
